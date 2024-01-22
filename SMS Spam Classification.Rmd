@@ -1,0 +1,392 @@
+---
+title: "SMS Spam Classification"
+author: "Soumyadeep Poddar"
+date: "2023-08-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction:
+
+The goal of this report is to show the steps of a data analysis project that uses text data to classify SMS messages into SPAM or not SPAM. This data source can be obtained from Kaggle -
+`https://www.kaggle.com/datasets/uciml/sms-spam-collection-dataset/code?select=spam.csv`
+
+## Data Analysis Steps:
+
+This project will use the following steps to create this classifier:
+
+1. Load the data and check data quality.
+
+2. Split the data in training and testing datasets.
+
+3. Features engineering using simple stats and regex.
+
+4. Creation of semantic dictionaries to be used as features.
+
+5. Apply a machine learning algorithm.
+
+6. Assess performance
+
+7. Closing remarks
+
+## Execution
+
+1. <b> Loading the data and data quality </b>
+
+
+```{r}
+library(tidytext)
+library(skimr)
+library(dplyr)
+spam = read.csv(
+  file = "spam.csv", 
+  header = T,
+  fileEncoding = "latin1"
+  )
+str(spam)
+```
+
+Mutating the data to create 3 columns:
+
+* is_spam: identifies if the SMS message is spam or not (ham).
+
+* sms: SMS content in text format.
+
+* id: identifier of each SMS.
+
+
+```{r}
+spam = spam %>%
+  mutate(
+    is_spam = v1,
+    sms = v2
+  )
+
+spam = spam %>%
+  select(is_spam, sms) %>%
+  mutate(
+    id = 1:dim(spam)[1]
+  )
+
+knitr::kable(head(spam))
+```
+
+
+2. <b> Splitting the data in training and testing sets: </b>
+
+In the following code I’m splitting the dataset randomly $50 \%-50\%$ in training and testing datasets. We will use the training dataset to train the machine learning algorithm and apply the estimates on test dataset to assess performance and overfitting.
+
+```{r}
+# Splitting the dataset in training and testing
+set.seed(123)
+train = spam %>%
+  sample_n(round(dim(spam)[1]/2))
+
+test = spam %>%
+  filter(!id %in% train$id)
+
+dim(train)
+dim(test)
+```
+
+3. <b> Features engineering: </b>
+
+In this session we will use some text mining basic tools such as character counting and some regular expressions to extract some deterministic elements from the text content and create features that will happen in our classification task.
+
+```{r}
+library(stringi)
+library(stringr)
+library(qdapRegex)
+
+train_features = train %>%
+  mutate(
+    char_count = nchar(sms), # Count the number of characters
+    has_numbers = ifelse(grepl("[0-9]", sms), 1, 0), # Boolean if the string has numbers
+    numbers_count = str_count(sms, "[0-9]"), # Count of number digits
+    has_url = ifelse(grepl(grab("@rm_url"), sms), 1, 0), # Detect URL (needs improvement)
+    has_date = ifelse(grepl(grab("@rm_date"), sms), 1, 0), # Detect Dates
+    has_dollar = ifelse(grepl(grab("@rm_dollar"), sms), 1, 0), # Detect Dollar Sign
+    has_emoticon = ifelse(grepl(grab("@rm_emoticon"), sms), 1, 0), # Detect Emoticon
+    has_email = ifelse(grepl(grab("@rm_email"), sms), 1, 0), # Detect Dates
+    has_phone = ifelse(grepl(grab("@rm_phone"), sms), 1, 0), # Detect Phone Number
+  )
+
+skim_without_charts(train_features)
+
+```
+
+The summary table above show some examples of how frequently some objects appear on those SMS messages. For example, URLs appear on 2% of the data, 25% of the messages contains numbers, 7% contains phone numbers and 18% contains emoticons Just out of curiosity, let’s see what is the proportion of messages with URL that were classified as SPAM, so we can get a sense of predictive power of this feature:
+
+```{r}
+library(tidyr)
+train_features %>%
+  count(is_spam, has_url) %>%
+  pivot_wider(
+    names_from = "is_spam", 
+    values_from = "n", 
+    values_fill = 0  
+  ) %>%
+  mutate(
+    total = ham + spam,
+    spam_pct = round(spam / total * 100,1)
+  ) %>%
+  knitr::kable(.)
+```
+
+So, according to the table above, the rate of spam is 96.2% on messages that contain an URL, while only 11.6% on messages that don’t contain URL. Let’s get another example with emoticon:
+
+```{r}
+train_features %>%
+  count(is_spam, has_emoticon) %>%
+  pivot_wider(
+    names_from = "is_spam", 
+    values_from = "n", 
+    values_fill = 0  
+  ) %>%
+  mutate(
+    total = ham + spam,
+    spam_pct = round(spam / total * 100,1)
+  ) %>%
+  knitr::kable(.)
+```
+
+Here is also an interesting result: messages with emoticons also have a higher rate of SPAM (40.6%) compared to messages without emoticon (7.2%). However, look how lift is different compared to URLs. While for URLs the lift is 8.3x (96.2/11.6), for emoticon is 5.6 (40.6/7.2). The two variables show strong predictable power but URLs is stronger.
+
+Now, let’s explore some word frequency techniques to identify which words are more related to SPAM and create a dictionary that can help us build more features based on textual content.
+
+4. <b> Semantic Dictionaries: </b>
+
+We can start by exploring what words happen more frequently on SPAM messages but not in HAM. But before that, we need to process the text a little bit to remove noise:
+
+```{r}
+library(tidytext)
+library(ggplot2)
+
+stopwords_en = get_stopwords(language = "en")
+
+train %>%
+  unnest_tokens(word, sms) %>%
+  anti_join(stopwords_en) %>% # This removes too frequent words that don't add meaning.
+  filter(nchar(word) >= 3) %>% # Remove too short words
+  count(is_spam, word) %>% # Counting word frequency
+  group_by(is_spam) %>%
+  arrange(-n) %>% # Ordering from more to less frequent
+  slice_head(n = 10) %>%
+  ggplot(aes(x = word, y = n, fill = is_spam)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ is_spam, scales = "free_y") +
+  coord_flip() +
+  theme_light(base_size = 13) +
+  labs(
+    title = "Top 10 frequent words in ham and spam SMS messages.",
+    subtitle = "Kaggle SMS SPAM Dataset",
+    x = "Words",
+    y = "Frequency"
+  )
+```
+
+We have very interesting insights from this chart above, where we can see that words with highest frequency in SPAM messages are: stop, text, reply, mobile, free, claim. You probably can recognize these words from most SPAM messages that you receive every day.
+
+To highlight the contrast of words, we can calculate the relative frequency of those words within ham and spam and calculate the ratio of proportions to see the word lift to detect spam:
+
+```{r}
+spam_docs = train %>%
+  count(is_spam, name = "total_docs")
+
+spam_dict = train %>%
+  unnest_tokens(word, sms) %>%
+  anti_join(stopwords_en) %>% # This removes too frequent words that don't add meaning.
+  filter(nchar(word) >= 3) %>%
+  count(is_spam, word) %>%
+  inner_join(spam_docs) %>%
+  mutate(
+    word_prop = n/total_docs
+  ) %>%
+  dplyr::select(word_prop, is_spam, word) %>%
+  pivot_wider(names_from = "is_spam", values_from = "word_prop", names_prefix = "word_") %>%
+  filter(word_ham > 0, word_spam > 0) %>%
+  mutate(
+    word_ratio = word_spam / word_ham
+  ) 
+
+top_30_spam_words = spam_dict %>%
+  arrange(-word_ratio) %>%
+  slice_head(n = 30)
+
+top_30_spam_words %>%
+  mutate(
+    page = c(rep(1, 10), rep(2,10), rep(3,10))
+  ) %>%
+  ggplot(aes(x = word, y = word_ratio)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~ page, scales = "free_y") +
+  theme_light(base_size = 13) +
+  labs(
+    title = "Top 30 Word Lift on SPAM messages over HAM messages.",
+    subtitle = "Words with bigger predictive power to detect SPAM messages.",
+    x = "Words",
+    y = "Lift (Relative Freq. Ratio)"
+  )
+```
+
+These are the words with bigger relative frequency happening on SPAM messages compared to their frequencies on HAM messages. You can recognize many words on SPAM messages and we can build a dictionary using this criteria by selecting the top X words as part of a dictionary and then we can count these words in each document to create a dictionary based feature. Lets use these 30 words as our SPAM dictionary and create a new feature:
+
+```{r}
+train_features_complete = train_features %>%
+  left_join(
+    train %>%
+    unnest_tokens(word, sms) %>%
+    anti_join(stopwords_en) %>% # This removes too frequent words that don't add meaning.
+    filter(nchar(word) >= 3) %>%
+    dplyr::select(id, word) %>%
+    inner_join(top_30_spam_words) %>%
+    count(id, name = "spam_words_count")
+  ) %>%
+  mutate(
+    spam_words_count = replace_na(spam_words_count, 0),
+    is_spam_binary = ifelse(is_spam == "spam", 1, 0)
+  ) %>%
+  dplyr::select(-id, -sms)
+
+train_features_complete %>%
+  count(spam_words_count, is_spam) %>%
+  pivot_wider(names_from = is_spam, values_from = n, values_fill = 0) %>%
+  mutate(
+    total = ham + spam,
+    spam_pct = round(spam / total * 100,1)
+  ) %>%
+  knitr::kable(.)
+
+```
+
+The table above shows how effective this new feature is! As the number of spam words increase, the % of SPAM SMS increases significantly. Note also that this feature also detects a good portion of SPAM messages.
+
+5. <b> Machine Learning Model: </b>
+
+Finally, let’s try using a simple logistic regression first to model the probability of an SMS being SPAM:
+
+```{r}
+mod.glm = glm(
+  is_spam_binary ~ ., 
+  data = train_features_complete %>% dplyr::select(-is_spam), 
+  family = "binomial"
+  )
+summary(mod.glm)
+```
+
+```{r}
+library(caret)
+confusionMatrix(
+  factor(ifelse(predict(mod.glm, train_features_complete, type = "response") > 0.5, 1, 0)),
+  reference = factor(train_features_complete$is_spam_binary),
+  
+)
+```
+
+```{r}
+library(pROC)
+auc(
+  train_features_complete$is_spam_binary, 
+  predict(mod.glm, train_features_complete, type = "response")
+  )
+```
+
+6. <b> Performance on Testing Set: </b>
+
+The logistic regression shows a very good performance with AUC > 0.9. Usually this is too good to be true but also expected as we’re using the training data. Now, let’s apply the same feature engineering to the test set, apply the model and check if we get similar results:
+
+```{r}
+# Feature Engineering
+test_features_complete = test %>%
+  mutate(
+    char_count = nchar(sms), # Count the number of characters
+    has_numbers = ifelse(grepl("[0-9]", sms), 1, 0), # Boolean if the string has numbers
+    numbers_count = str_count(sms, "[0-9]"), # Count of number digits
+    has_url = ifelse(grepl(grab("@rm_url"), sms), 1, 0), # Detect URL (needs improvement)
+    has_date = ifelse(grepl(grab("@rm_date"), sms), 1, 0), # Detect Dates
+    has_dollar = ifelse(grepl(grab("@rm_dollar"), sms), 1, 0), # Detect Dollar Sign
+    has_emoticon = ifelse(grepl(grab("@rm_emoticon"), sms), 1, 0), # Detect Emoticon
+    has_email = ifelse(grepl(grab("@rm_email"), sms), 1, 0), # Detect Dates
+    has_phone = ifelse(grepl(grab("@rm_phone"), sms), 1, 0), # Detect Phone Number
+  ) %>%
+  left_join(
+    test %>%
+      unnest_tokens(word, sms) %>%
+      anti_join(stopwords_en) %>% # This removes too frequent words that don't add meaning.
+      filter(nchar(word) >= 3) %>%
+      dplyr::select(id, word) %>%
+      inner_join(top_30_spam_words) %>%
+      count(id, name = "spam_words_count")
+  ) %>%
+  mutate(
+    spam_words_count = replace_na(spam_words_count, 0),
+    is_spam_binary = ifelse(is_spam == "spam", 1, 0)
+  ) %>%
+  dplyr::select(-id, -sms)
+```
+
+With the features built, let’s apply the model and assess performance:
+
+```{r}
+confusionMatrix(
+  factor(ifelse(predict(mod.glm, test_features_complete, type = "response") > 0.5, 1, 0)),
+  reference = factor(test_features_complete$is_spam_binary),
+  
+)
+```
+
+```{r}
+auc(
+  test_features_complete$is_spam_binary, 
+  predict(mod.glm, test_features_complete, type = "response")
+  )
+```
+
+Surprisingly, the model shows consistent results between training and testing sets, with AUC > 0.9, showing that these features have high predictive power for this use case.
+
+Interpreting coefficients:
+
+The following chart shows the odds ratio of each model component and it’s helpful to understand and interpret which features in the model are contributing most in predicting SPAM:
+
+```{r}
+library(sjPlot)
+
+plot_model(
+  mod.glm, 
+  show.values = T, 
+  value.size = 3, 
+  line.size = 0.2, 
+  value.offset = 0.4,
+  vline.color = "grey",
+  sort.est = T
+  ) +
+  theme_light(base_size = 13) +
+  labs(
+    title = "Odds ratio of model features.",
+    subtitle = "Estimates from logistic regression model. Colors indicating OR below or above 1."
+  )
+```
+
+Looking at the chart above, we can understand that:
+
+* SMS that have an URL has 81.4x higher risk of being SPAM, being the biggest statistically significant predictor in this model.
+
+* Having an email on SMS content have a big predictive effect, but the lack of coverage doesn’t allow this effect be statistically significant.
+
+* Having spam words in SMS content, created thought our SPAM dictionary technique, increase 8.9x the risk of being SPAM for each word detected. Note that the same SMS can have multiple SPAM words, increasing the risk multiple times. So we can understand here that the effort of building a SPAM dictionary using the text data was important to improve model performance.
+
+* Other factors with significant effects also were: presence of numbers, presence of emoticon and numbers count in SMS content.
+
+* The remaining factors were not statistically significant: has phone number, characters count, has date and has dollar sign.
+
+7. <b> Closing: </b>
+
+In this report we trained a model to predict if a SMS message is SPAM or not. We used features that were created based on fixed rules searching for regular expressions in the content as well as SPAM dictionaries that were created using the own SMS content and training labels.
+
+Important to note that we didn’t need to use an advanced text mining technique such as word embeddings neither advanced machine learning models as the features used had enough prediction value and the logistic regression model was good enough for our use case.
+
+The performance of final model on testing data set showed that this model is good to generalize results, having a AUC similar between training and testing sets meaning that the model is stable.
